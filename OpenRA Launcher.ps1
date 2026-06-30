@@ -305,28 +305,30 @@ $script:ProgressCanvas.BorderStyle = "FixedSingle"
 $progressPanel.Controls.Add($script:ProgressCanvas)
 
 # Paint event for classic Steam style
-$script:ProgressCanvas.Add_Paint({
+$paintScript = {
     param($sender, $e)
     
     if ($script:ProgressValue -eq 0) {
         return
     }
     
-    $barWidth = $sender.Width - 4
-    $barHeight = $sender.Height - 4
+    $barWidth = [int]$sender.Width - 4
+    $barHeight = [int]$sender.Height - 4
     $filledWidth = [int]([double]$script:ProgressValue / 100.0 * $barWidth)
     
     # Draw animated segments (classic Steam mod download style)
     $segmentSize = 8
     $segmentGap = 2
-    $x = 2
+    $x = [int]2
     
-    while ($x < $filledWidth) {
-        $rect = New-Object System.Drawing.Rectangle($x, 2, $segmentSize, $barHeight)
-        $e.Graphics.FillRectangle([System.Drawing.Brushes]::FromArgb(153, 204, 0), $rect)
-        $x += $segmentSize + $segmentGap
+    while ([int]$x -lt [int]$filledWidth) {
+        $rect = New-Object System.Drawing.Rectangle([int]$x, 2, $segmentSize, $barHeight)
+        $e.Graphics.FillRectangle([System.Drawing.Brushes]::Lime, $rect)
+        $x = [int]($x + $segmentSize + $segmentGap)
     }
-})
+}
+
+$script:ProgressCanvas.Add_Paint($paintScript)
 
 # Progress label
 $script:ProgressLabel = New-Object Windows.Forms.Label
