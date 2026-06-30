@@ -1,5 +1,5 @@
 # =========================
-# SAFE MODE INIT (NO ERRORS EVER)
+# SAFE MODE INIT
 # =========================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -9,11 +9,17 @@ $ErrorActionPreference = "SilentlyContinue"
 # =========================
 # PATHS
 # =========================
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$app  = Join-Path $root "app"
-$data = Join-Path $root "zData"
-$userData = Join-Path $root "zUserData"
-$assets = Join-Path $data "portable\assets"
+$script:Root = Split-Path -Parent $MyInvocation.MyCommand.Path
+$script:AppDir = Join-Path $script:Root "app"
+$script:DataDir = Join-Path $script:Root "zData"
+$script:UserDataDir = Join-Path $script:Root "zUserData"
+$script:AssetsDir = Join-Path $script:DataDir "portable\assets"
+
+# =========================
+# STATE
+# =========================
+$script:DownloadInProgress = $false
+$script:CurrentProgress = 0
 
 # =========================
 # WINDOW
@@ -26,11 +32,8 @@ $form.BackColor = [Drawing.Color]::FromArgb(20,20,20)
 $form.FormBorderStyle = "FixedSingle"
 $form.MaximizeBox = $false
 
-# =========================
-# ICON (SAFE LOAD)
-# =========================
 try {
-    $iconPath = Join-Path $assets "icon.ico"
+    $iconPath = Join-Path $script:AssetsDir "icon.ico"
     if (Test-Path $iconPath) {
         $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($iconPath)
     }
@@ -40,7 +43,7 @@ try {
 # FIND GAME EXE
 # =========================
 function Find-Exe($name) {
-    foreach ($p in @($root,$app)) {
+    foreach ($p in @($script:Root, $script:AppDir)) {
         if (Test-Path $p) {
             $f = Get-ChildItem $p -Recurse -Filter $name -ErrorAction SilentlyContinue | Select-Object -First 1
             if ($f) { return $f.FullName }
@@ -53,22 +56,16 @@ function Find-Exe($name) {
 # CONTENT STATE DETECTION
 # =========================
 function Get-ContentState {
-    $state = @{
-        RA = $false
-        TD = $false
-        D2K = $false
-    }
-
-    # EXE-based detection
-    if (Find-Exe "RedAlert.exe")     { $state.RA = $true }
+    $state = @{ RA = $false; TD = $false; D2K = $false }
+    
+    if (Find-Exe "RedAlert.exe") { $state.RA = $true }
     if (Find-Exe "TiberianDawn.exe") { $state.TD = $true }
-    if (Find-Exe "Dune2000.exe")     { $state.D2K = $true }
-
-    # mod folder detection (OpenRA style)
-    if (Test-Path (Join-Path $app "mods\ra"))  { $state.RA = $true }
-    if (Test-Path (Join-Path $app "mods\cnc")) { $state.TD = $true }
-    if (Test-Path (Join-Path $app "mods\d2k")) { $state.D2K = $true }
-
+    if (Find-Exe "Dune2000.exe") { $state.D2K = $true }
+    
+    if (Test-Path (Join-Path $script:AppDir "mods\ra")) { $state.RA = $true }
+    if (Test-Path (Join-Path $script:AppDir "mods\cnc")) { $state.TD = $true }
+    if (Test-Path (Join-Path $script:AppDir "mods\d2k")) { $state.D2K = $true }
+    
     return $state
 }
 
@@ -78,8 +75,8 @@ function Get-ContentState {
 function Enable-PortableMode {
     param([string]$TargetMode = "UserData")
     
-    $supportDir = Join-Path $app "Support"
-    $targetDir = if ($TargetMode -eq "Portable") { $data } else { $userData }
+    $supportDir = Join-Path $script:AppDir "Support"
+    $targetDir = if ($TargetMode -eq "Portable") { $script:DataDir } else { $script:UserDataDir }
     
     try {
         if (!(Test-Path $targetDir)) {
@@ -106,22 +103,19 @@ function Launch($exe, $mode) {
 }
 
 # =========================
-# PROGRESS BAR STATE
+# PROGRESS BAR UPDATE
 # =========================
-$script:ProgressValue = 0
-$script:IsDownloading = $false
-
-function Set-ProgressBar {
-    param([int]$Percent)
+function Update-ProgressBar {
+    param([int]$Percent, [string]$Label)
     
-    $script:ProgressValue = [Math]::Min([int]$Percent, 100)
-    
-    if ($script:ProgressLabel) {
-        $script:ProgressLabel.Text = "Downloading... $($script:ProgressValue)%"
-    }
+    $script:CurrentProgress = [Math]::Min([int]$Percent, 100)
     
     if ($script:ProgressBar) {
-        $script:ProgressBar.Value = $script:ProgressValue
+        $script:ProgressBar.Value = $script:CurrentProgress
+    }
+    
+    if ($script:ProgressLabel) {
+        $script:ProgressLabel.Text = $Label
     }
     
     $form.Refresh()
@@ -129,183 +123,179 @@ function Set-ProgressBar {
 }
 
 # =========================
-# DOWNLOAD ENGINE (WORKING)
+# DOWNLOAD WITH PROPER ASYNC
 # =========================
-function Download-File {
-    param(
-        [string]$url,
-        [string]$out
-    )
-    
+function Download-OpenRA {
     try {
-        $wc = New-Object System.Net.WebClient
-        
-        $progressAction = {
-            param($s,$e)
-            Set-ProgressBar $e.ProgressPercentage
-        }
-        
-        $wc.DownloadProgressChanged += $progressAction
-        $wc.DownloadFileCompleted += {
-            $script:IsDownloading = $false
-        }
-        
-        $script:IsDownloading = $true
-        $wc.DownloadFileAsync((New-Object Uri $url), $out)
-        
-        $timeout = 0
-        while ($script:IsDownloading -and $timeout -lt 10800) {
-            Start-Sleep -Milliseconds 100
-            $timeout += 1
-            [System.Windows.Forms.Application]::DoEvents()
-        }
-        
-        return (Test-Path $out)
-    }
-    catch {
-        $script:IsDownloading = $false
-        return $false
-    }
-}
-
-# =========================
-# INSTALL OPENRA (FIXED)
-# =========================
-function Install-OpenRA {
-    try {
-        $script:ProgressLabel.Text = "Fetching latest release..."
-        $script:ProgressValue = 0
-        $script:ProgressBar.Value = 0
-        $form.Refresh()
+        Update-ProgressBar 0 "Fetching latest release from GitHub..."
+        Start-Sleep -Milliseconds 500
         
         $repo = "OpenRA/OpenRA"
-        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -TimeoutSec 10 -ErrorAction Stop
+        $apiUrl = "https://api.github.com/repos/$repo/releases/latest"
+        
+        $rel = Invoke-WebRequest -Uri $apiUrl -UseBasicParsing -TimeoutSec 15 | ConvertFrom-Json
         
         if (-not $rel) {
-            $script:ProgressLabel.Text = "Error: Could not reach GitHub"
-            $script:ProgressBar.Value = 0
+            Update-ProgressBar 0 "ERROR: Could not reach GitHub"
             return $false
         }
         
+        # Find portable Windows ZIP
         $asset = $null
         foreach ($a in $rel.assets) {
-            if ($a.name -like "*win*portable*") {
+            $name = $a.name
+            if ($name -like "*x64-winportable*" -or ($name -like "*win*portable*")) {
                 $asset = $a
                 break
             }
         }
         
-        if (-not $asset) { 
-            $script:ProgressLabel.Text = "Error: No portable release found"
-            $script:ProgressBar.Value = 0
+        if (-not $asset) {
+            Update-ProgressBar 0 "ERROR: No Windows portable release found"
             return $false
         }
         
-        $zip = Join-Path $env:TEMP "openra.zip"
-        $tmp = Join-Path $env:TEMP "openra_extract"
+        Update-ProgressBar 20 "Found release: $($asset.name)"
+        Start-Sleep -Milliseconds 500
         
-        # Remove old files
+        $zip = Join-Path $env:TEMP "openra_latest.zip"
+        $tmpExtract = Join-Path $env:TEMP "openra_tmp_$(Get-Random)"
+        
+        # Clean old temp files
         if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
-        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $tmpExtract) { Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue }
         
-        # Download
-        $script:ProgressLabel.Text = "Downloading OpenRA..."
-        $script:ProgressValue = 0
-        $script:ProgressBar.Value = 0
-        $form.Refresh()
+        # DOWNLOAD
+        Update-ProgressBar 25 "Downloading $($asset.name)..."
         
-        $dlSuccess = Download-File -url $asset.browser_download_url -out $zip
+        $script:DownloadInProgress = $true
         
-        if (-not $dlSuccess) {
-            $script:ProgressLabel.Text = "Error: Download failed"
-            $script:ProgressBar.Value = 0
+        $wc = New-Object System.Net.WebClient
+        $downloadCompleted = $false
+        $downloadError = $false
+        
+        $wc.add_DownloadProgressChanged({
+            $percent = [Math]::Min($_.ProgressPercentage, 99)
+            Update-ProgressBar ([int]$percent) "Downloading... $percent%"
+        })
+        
+        $wc.add_DownloadFileCompleted({
+            $script:DownloadInProgress = $false
+            $downloadCompleted = $true
+            if ($_.Error) { $downloadError = $true }
+        })
+        
+        $wc.DownloadFileAsync($asset.browser_download_url, $zip)
+        
+        # Wait for download
+        $maxWait = 0
+        while ($script:DownloadInProgress -and $maxWait -lt 1800) {
+            Start-Sleep -Milliseconds 100
+            $maxWait++
+            [System.Windows.Forms.Application]::DoEvents()
+        }
+        
+        if (-not (Test-Path $zip) -or $downloadError) {
+            Update-ProgressBar 0 "ERROR: Download failed"
             return $false
         }
         
-        # Extract
-        $script:ProgressLabel.Text = "Extracting files..."
-        Set-ProgressBar 75
+        Update-ProgressBar 80 "Extracting files..."
+        Start-Sleep -Milliseconds 300
         
-        Expand-Archive -Path $zip -DestinationPath $tmp -Force -ErrorAction Stop
+        # EXTRACT
+        Expand-Archive -Path $zip -DestinationPath $tmpExtract -Force -ErrorAction Stop
         
-        # Copy to app
-        if (!(Test-Path $app)) { New-Item -ItemType Directory -Path $app -Force | Out-Null }
+        Update-ProgressBar 85 "Preparing installation..."
         
-        # Remove old app contents
-        Get-ChildItem -Path $app -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        # BACKUP
+        if (!(Test-Path $script:AppDir)) {
+            New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        }
         
-        Copy-Item -Path "$tmp\*" -Destination $app -Recurse -Force -ErrorAction Stop
+        # Remove old app (but keep Support symlink)
+        $oldAppBackup = Join-Path $env:TEMP "openra_backup_$(Get-Random)"
+        if (Test-Path $script:AppDir) {
+            Move-Item $script:AppDir $oldAppBackup -Force -ErrorAction SilentlyContinue
+            New-Item -ItemType Directory -Path $script:AppDir -Force | Out-Null
+        }
         
-        # Cleanup temp files
+        # COPY NEW VERSION
+        Copy-Item "$tmpExtract\*" $script:AppDir -Recurse -Force -ErrorAction Stop
+        
+        Update-ProgressBar 95 "Finalizing..."
+        
+        # Clean temp
         Remove-Item $zip -Force -ErrorAction SilentlyContinue
-        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmpExtract -Recurse -Force -ErrorAction SilentlyContinue
+        if (Test-Path $oldAppBackup) { Remove-Item $oldAppBackup -Recurse -Force -ErrorAction SilentlyContinue }
         
-        $script:ProgressLabel.Text = "Installation complete!"
-        Set-ProgressBar 100
+        Update-ProgressBar 100 "Installation complete!"
+        Start-Sleep -Milliseconds 1000
+        Update-ProgressBar 0 "Ready"
         
         return $true
     }
     catch {
-        $script:ProgressLabel.Text = "Error: $_"
-        $script:ProgressBar.Value = 0
+        Update-ProgressBar 0 "ERROR: $_"
         return $false
     }
 }
 
 # =========================
-# SMART REPAIR (FIXED)
+# SMART REPAIR
 # =========================
 function Smart-Repair {
     try {
-        $script:ProgressLabel.Text = "Checking games..."
-        Set-ProgressBar 20
+        Update-ProgressBar 10 "Checking installed games..."
+        Start-Sleep -Milliseconds 300
         
         $state = Get-ContentState
-        
         $missing = 0
         if (-not $state.RA) { $missing++ }
         if (-not $state.TD) { $missing++ }
         if (-not $state.D2K) { $missing++ }
         
         if ($missing -eq 0) {
-            $script:ProgressLabel.Text = "All games present - no repair needed"
-            Set-ProgressBar 100
+            Update-ProgressBar 100 "All games installed!"
+            Start-Sleep -Milliseconds 1000
+            Update-ProgressBar 0 "Ready"
             return $true
         }
         
-        $script:ProgressLabel.Text = "Missing $missing game(s) - installing..."
-        Install-OpenRA
+        Update-ProgressBar 20 "Missing $missing game(s) - Installing..."
+        Start-Sleep -Milliseconds 500
         
+        Download-OpenRA
         return $true
     }
     catch {
-        $script:ProgressLabel.Text = "Error: Repair failed"
-        $script:ProgressBar.Value = 0
+        Update-ProgressBar 0 "Repair failed: $_"
         return $false
     }
 }
 
 # =========================
-# MAIN LAYOUT STRUCTURE
+# LAYOUT
 # =========================
-$topPanel = New-Object Windows.Forms.Panel
-$topPanel.Size = New-Object Drawing.Size(1100, 570)
-$topPanel.Location = New-Object Drawing.Point(0, 0)
-$topPanel.BackColor = [Drawing.Color]::FromArgb(20,20,20)
-$form.Controls.Add($topPanel)
+$mainPanel = New-Object Windows.Forms.Panel
+$mainPanel.Size = New-Object Drawing.Size(1100, 570)
+$mainPanel.Location = New-Object Drawing.Point(0, 0)
+$mainPanel.BackColor = [Drawing.Color]::FromArgb(20,20,20)
+$form.Controls.Add($mainPanel)
 
-$side = New-Object Windows.Forms.Panel
-$side.Size = New-Object Drawing.Size(200, 570)
-$side.Location = New-Object Drawing.Point(0, 0)
-$side.BackColor = [Drawing.Color]::FromArgb(30,30,30)
-$topPanel.Controls.Add($side)
+$sidebar = New-Object Windows.Forms.Panel
+$sidebar.Size = New-Object Drawing.Size(200, 570)
+$sidebar.Location = New-Object Drawing.Point(0, 0)
+$sidebar.BackColor = [Drawing.Color]::FromArgb(30,30,30)
+$mainPanel.Controls.Add($sidebar)
 
-$content = New-Object Windows.Forms.Panel
-$content.Size = New-Object Drawing.Size(900, 570)
-$content.Location = New-Object Drawing.Point(200, 0)
-$content.BackColor = [Drawing.Color]::FromArgb(20,20,20)
-$content.AutoScroll = $true
-$topPanel.Controls.Add($content)
+$contentArea = New-Object Windows.Forms.Panel
+$contentArea.Size = New-Object Drawing.Size(900, 570)
+$contentArea.Location = New-Object Drawing.Point(200, 0)
+$contentArea.BackColor = [Drawing.Color]::FromArgb(20,20,20)
+$contentArea.AutoScroll = $true
+$mainPanel.Controls.Add($contentArea)
 
 $progressPanel = New-Object Windows.Forms.Panel
 $progressPanel.Size = New-Object Drawing.Size(1100, 80)
@@ -314,7 +304,7 @@ $progressPanel.BackColor = [Drawing.Color]::FromArgb(25,25,25)
 $progressPanel.BorderStyle = "FixedSingle"
 $form.Controls.Add($progressPanel)
 
-# Standard progress bar
+# Progress Bar
 $script:ProgressBar = New-Object Windows.Forms.ProgressBar
 $script:ProgressBar.Size = New-Object Drawing.Size(850, 20)
 $script:ProgressBar.Location = New-Object Drawing.Point(220, 15)
@@ -332,101 +322,109 @@ $script:ProgressLabel.Font = New-Object Drawing.Font("Segoe UI", 10)
 $progressPanel.Controls.Add($script:ProgressLabel)
 
 # =========================
-# BUTTON STYLES
+# BUTTON STYLES (FIXED)
 # =========================
-$normalColor = [Drawing.Color]::FromArgb(50,50,50)
-$hoverColor = [Drawing.Color]::FromArgb(70,70,70)
-$activeColor = [Drawing.Color]::FromArgb(76,110,45)
-$quitColor = [Drawing.Color]::FromArgb(139,0,0)
-
-function Btn($text,$y,$action) {
-    $b = New-Object Windows.Forms.Button
-    $b.Text = $text
-    $b.Size = New-Object Drawing.Size(180,45)
-    $b.Location = New-Object Drawing.Point(10,$y)
-    $b.BackColor = $normalColor
-    $b.ForeColor = "White"
-    $b.FlatStyle = "Flat"
-    $b.FlatAppearance.BorderSize = 0
-    $b.Cursor = "Hand"
-    $b.Font = New-Object Drawing.Font("Segoe UI", 9)
-
-    $b.Add_MouseEnter({ $this.BackColor = $hoverColor })
-    $b.Add_MouseLeave({ $this.BackColor = $normalColor })
-    $b.Add_MouseDown({
+function Make-SidebarBtn {
+    param([string]$Text, [int]$Y, [scriptblock]$ClickAction)
+    
+    $btn = New-Object Windows.Forms.Button
+    $btn.Text = $Text
+    $btn.Size = New-Object Drawing.Size(180, 45)
+    $btn.Location = New-Object Drawing.Point(10, $Y)
+    $btn.BackColor = [Drawing.Color]::FromArgb(50,50,50)
+    $btn.ForeColor = "White"
+    $btn.FlatStyle = "Flat"
+    $btn.FlatAppearance.BorderSize = 0
+    $btn.Cursor = "Hand"
+    $btn.Font = New-Object Drawing.Font("Segoe UI", 9)
+    $btn.Tag = @{ NormalY = $Y; IsAnimating = $false }
+    
+    $hoverColor = [Drawing.Color]::FromArgb(70,70,70)
+    $normalColor = [Drawing.Color]::FromArgb(50,50,50)
+    $activeColor = [Drawing.Color]::FromArgb(76, 110, 45)
+    
+    $btn.Add_MouseEnter({
+        if (-not $this.Tag.IsAnimating) {
+            $this.BackColor = $hoverColor
+        }
+    })
+    
+    $btn.Add_MouseLeave({
+        if (-not $this.Tag.IsAnimating) {
+            $this.BackColor = $normalColor
+        }
+    })
+    
+    $btn.Add_Click({
+        $this.Tag.IsAnimating = $true
         $this.BackColor = $activeColor
         $this.Size = New-Object Drawing.Size(260, 80)
-        $this.Location = New-Object Drawing.Point(-30, $y - 17)
+        $this.Location = New-Object Drawing.Point(-30, $this.Tag.NormalY - 17)
         $this.Font = New-Object Drawing.Font("Segoe UI", 12, "Bold")
-    })
-    $b.Add_MouseUp({
-        $this.BackColor = $hoverColor
+        $form.Refresh()
+        
+        Start-Sleep -Milliseconds 100
+        
+        & $ClickAction
+        
+        Start-Sleep -Milliseconds 100
+        
+        $this.BackColor = $normalColor
         $this.Size = New-Object Drawing.Size(180, 45)
-        $this.Location = New-Object Drawing.Point(10, $y)
+        $this.Location = New-Object Drawing.Point(10, $this.Tag.NormalY)
         $this.Font = New-Object Drawing.Font("Segoe UI", 9)
+        $this.Tag.IsAnimating = $false
+        $form.Refresh()
     })
-
-    $b.Add_Click($action)
-    $side.Controls.Add($b)
+    
+    return $btn
 }
 
-function QuitBtn($text,$y) {
-    $b = New-Object Windows.Forms.Button
-    $b.Text = $text
-    $b.Size = New-Object Drawing.Size(180,45)
-    $b.Location = New-Object Drawing.Point(10,$y)
-    $b.BackColor = $quitColor
-    $b.ForeColor = "White"
-    $b.FlatStyle = "Flat"
-    $b.FlatAppearance.BorderSize = 0
-    $b.Cursor = "Hand"
-    $b.Font = New-Object Drawing.Font("Segoe UI", 9)
-
-    $b.Add_MouseEnter({ $this.BackColor = [Drawing.Color]::FromArgb(170,0,0) })
-    $b.Add_MouseLeave({ $this.BackColor = $quitColor })
-    $b.Add_MouseDown({
-        $this.BackColor = $activeColor
-        $this.Size = New-Object Drawing.Size(260, 80)
-        $this.Location = New-Object Drawing.Point(-30, $y - 17)
-        $this.Font = New-Object Drawing.Font("Segoe UI", 12, "Bold")
-    })
-    $b.Add_MouseUp({
-        $this.BackColor = [Drawing.Color]::FromArgb(170,0,0)
-        $this.Size = New-Object Drawing.Size(180, 45)
-        $this.Location = New-Object Drawing.Point(10, $y)
-        $this.Font = New-Object Drawing.Font("Segoe UI", 9)
-    })
-
-    $b.Add_Click({ $form.Close() })
-    $side.Controls.Add($b)
+function Make-QuitBtn {
+    param([int]$Y)
+    
+    $btn = New-Object Windows.Forms.Button
+    $btn.Text = "QUIT"
+    $btn.Size = New-Object Drawing.Size(180, 45)
+    $btn.Location = New-Object Drawing.Point(10, $Y)
+    $btn.BackColor = [Drawing.Color]::FromArgb(139, 0, 0)
+    $btn.ForeColor = "White"
+    $btn.FlatStyle = "Flat"
+    $btn.FlatAppearance.BorderSize = 0
+    $btn.Cursor = "Hand"
+    $btn.Font = New-Object Drawing.Font("Segoe UI", 9)
+    
+    $btn.Add_Click({ $form.Close() })
+    return $btn
 }
 
 # =========================
-# SHOW GAME PAGE
+# GAME PAGE
 # =========================
-function Show-GamePage($gameName, $gameExe, $gameCode) {
-    $content.Controls.Clear()
-
+function Show-GamePage {
+    param([string]$GameName, [string]$GameExe, [string]$GameCode)
+    
+    $contentArea.Controls.Clear()
+    
     $state = Get-ContentState
-    $gameInstalled = if ($gameCode -eq "RA") { $state.RA }
-                    elseif ($gameCode -eq "TD") { $state.TD }
-                    else { $state.D2K }
-
+    $installed = if ($GameCode -eq "RA") { $state.RA }
+                elseif ($GameCode -eq "TD") { $state.TD }
+                else { $state.D2K }
+    
     $title = New-Object Windows.Forms.Label
-    $title.Text = $gameName
+    $title.Text = $GameName
     $title.Size = New-Object Drawing.Size(800, 70)
     $title.Location = New-Object Drawing.Point(40, 30)
     $title.ForeColor = [Drawing.Color]::FromArgb(153, 204, 0)
     $title.Font = New-Object Drawing.Font("Segoe UI", 36, "Bold")
-    $content.Controls.Add($title)
-
+    $contentArea.Controls.Add($title)
+    
     $status = New-Object Windows.Forms.Label
     $status.Size = New-Object Drawing.Size(400, 35)
     $status.Location = New-Object Drawing.Point(40, 110)
-    $status.ForeColor = "White"
     $status.Font = New-Object Drawing.Font("Segoe UI", 12)
     
-    if ($gameInstalled) {
+    if ($installed) {
         $status.Text = "✓ Game installed and ready"
         $status.ForeColor = [Drawing.Color]::LimeGreen
     } else {
@@ -434,172 +432,157 @@ function Show-GamePage($gameName, $gameExe, $gameCode) {
         $status.ForeColor = [Drawing.Color]::OrangeRed
     }
     
-    $content.Controls.Add($status)
-
-    if ($gameInstalled) {
+    $contentArea.Controls.Add($status)
+    
+    if ($installed) {
+        # PLAY BUTTON
         $playBtn = New-Object Windows.Forms.Button
-        $playBtn.Text = "Play"
-        $playBtn.Size = New-Object Drawing.Size(280, 60)
-        $playBtn.Location = New-Object Drawing.Point(40, 180)
-        $playBtn.BackColor = $normalColor
+        $playBtn.Text = "PLAY"
+        $playBtn.Size = New-Object Drawing.Size(280, 70)
+        $playBtn.Location = New-Object Drawing.Point(40, 200)
+        $playBtn.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
         $playBtn.ForeColor = "White"
         $playBtn.FlatStyle = "Flat"
         $playBtn.FlatAppearance.BorderSize = 0
         $playBtn.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
         $playBtn.Cursor = "Hand"
-
-        $playBtn.Add_MouseEnter({ $this.BackColor = $hoverColor })
-        $playBtn.Add_MouseLeave({ $this.BackColor = $normalColor })
-        $playBtn.Add_MouseDown({
-            $this.BackColor = $activeColor
-            $this.Size = New-Object Drawing.Size(380, 90)
-            $this.Location = New-Object Drawing.Point(-10, 150)
-            $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
+        $playBtn.Tag = @{ IsAnimating = $false }
+        
+        $playBtn.Add_Click({
+            if (-not $this.Tag.IsAnimating) {
+                $this.Tag.IsAnimating = $true
+                $this.BackColor = [Drawing.Color]::FromArgb(100, 150, 60)
+                $this.Size = New-Object Drawing.Size(380, 100)
+                $this.Location = New-Object Drawing.Point(-10, 165)
+                $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
+                $form.Refresh()
+                
+                Launch $GameExe "UserData"
+                
+                Start-Sleep -Milliseconds 500
+                
+                $this.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
+                $this.Size = New-Object Drawing.Size(280, 70)
+                $this.Location = New-Object Drawing.Point(40, 200)
+                $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
+                $this.Tag.IsAnimating = $false
+                $form.Refresh()
+            }
         })
-        $playBtn.Add_MouseUp({
-            $this.BackColor = $hoverColor
-            $this.Size = New-Object Drawing.Size(280, 60)
-            $this.Location = New-Object Drawing.Point(40, 180)
-            $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
-        })
-        $playBtn.Add_Click({ Launch $gameExe "UserData" })
-        $content.Controls.Add($playBtn)
-
+        
+        $contentArea.Controls.Add($playBtn)
+        
+        # PLAY PORTABLE BUTTON
         $portableBtn = New-Object Windows.Forms.Button
-        $portableBtn.Text = "Play Portable"
-        $portableBtn.Size = New-Object Drawing.Size(280, 60)
-        $portableBtn.Location = New-Object Drawing.Point(40, 270)
-        $portableBtn.BackColor = $normalColor
+        $portableBtn.Text = "PLAY PORTABLE"
+        $portableBtn.Size = New-Object Drawing.Size(280, 70)
+        $portableBtn.Location = New-Object Drawing.Point(40, 310)
+        $portableBtn.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
         $portableBtn.ForeColor = "White"
         $portableBtn.FlatStyle = "Flat"
         $portableBtn.FlatAppearance.BorderSize = 0
         $portableBtn.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
         $portableBtn.Cursor = "Hand"
-
-        $portableBtn.Add_MouseEnter({ $this.BackColor = $hoverColor })
-        $portableBtn.Add_MouseLeave({ $this.BackColor = $normalColor })
-        $portableBtn.Add_MouseDown({
-            $this.BackColor = $activeColor
-            $this.Size = New-Object Drawing.Size(380, 90)
-            $this.Location = New-Object Drawing.Point(-10, 240)
-            $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
+        $portableBtn.Tag = @{ IsAnimating = $false }
+        
+        $portableBtn.Add_Click({
+            if (-not $this.Tag.IsAnimating) {
+                $this.Tag.IsAnimating = $true
+                $this.BackColor = [Drawing.Color]::FromArgb(100, 150, 60)
+                $this.Size = New-Object Drawing.Size(380, 100)
+                $this.Location = New-Object Drawing.Point(-10, 275)
+                $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
+                $form.Refresh()
+                
+                Launch $GameExe "Portable"
+                
+                Start-Sleep -Milliseconds 500
+                
+                $this.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
+                $this.Size = New-Object Drawing.Size(280, 70)
+                $this.Location = New-Object Drawing.Point(40, 310)
+                $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
+                $this.Tag.IsAnimating = $false
+                $form.Refresh()
+            }
         })
-        $portableBtn.Add_MouseUp({
-            $this.BackColor = $hoverColor
-            $this.Size = New-Object Drawing.Size(280, 60)
-            $this.Location = New-Object Drawing.Point(40, 270)
-            $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
-        })
-        $portableBtn.Add_Click({ Launch $gameExe "Portable" })
-        $content.Controls.Add($portableBtn)
-
+        
+        $contentArea.Controls.Add($portableBtn)
+        
         $info = New-Object Windows.Forms.Label
-        $info.Text = "Play: Standard mode`nPlay Portable: Completely isolated sandbox experience"
-        $info.Size = New-Object Drawing.Size(700, 120)
-        $info.Location = New-Object Drawing.Point(40, 380)
+        $info.Text = "PLAY: Save to zUserData (standard mode)`nPLAY PORTABLE: Save to zData (isolated sandbox)"
+        $info.Size = New-Object Drawing.Size(700, 100)
+        $info.Location = New-Object Drawing.Point(40, 420)
         $info.ForeColor = [Drawing.Color]::Gray
-        $info.Font = New-Object Drawing.Font("Segoe UI", 11)
+        $info.Font = New-Object Drawing.Font("Segoe UI", 10)
         $info.AutoSize = $false
-        $content.Controls.Add($info)
-
+        $contentArea.Controls.Add($info)
+        
     } else {
         $installBtn = New-Object Windows.Forms.Button
-        $installBtn.Text = "Install Game"
-        $installBtn.Size = New-Object Drawing.Size(280, 70)
-        $installBtn.Location = New-Object Drawing.Point(40, 180)
+        $installBtn.Text = "INSTALL GAME"
+        $installBtn.Size = New-Object Drawing.Size(280, 80)
+        $installBtn.Location = New-Object Drawing.Point(40, 200)
         $installBtn.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
         $installBtn.ForeColor = "White"
         $installBtn.FlatStyle = "Flat"
         $installBtn.FlatAppearance.BorderSize = 0
         $installBtn.Font = New-Object Drawing.Font("Segoe UI", 13, "Bold")
         $installBtn.Cursor = "Hand"
-
-        $installBtn.Add_MouseEnter({ $this.BackColor = [Drawing.Color]::FromArgb(100, 150, 60) })
-        $installBtn.Add_MouseLeave({ $this.BackColor = [Drawing.Color]::FromArgb(76, 110, 45) })
-        $installBtn.Add_Click({ Show-InstallPage })
-        $content.Controls.Add($installBtn)
+        $installBtn.Tag = @{ IsAnimating = $false }
+        
+        $installBtn.Add_Click({
+            if (-not $this.Tag.IsAnimating) {
+                $this.Tag.IsAnimating = $true
+                $this.BackColor = [Drawing.Color]::FromArgb(100, 150, 60)
+                $this.Size = New-Object Drawing.Size(380, 120)
+                $this.Location = New-Object Drawing.Point(-10, 160)
+                $this.Font = New-Object Drawing.Font("Segoe UI", 16, "Bold")
+                $form.Refresh()
+                
+                Download-OpenRA
+                Show-GamePage $GameName $GameExe $GameCode
+                
+                $this.Tag.IsAnimating = $false
+            }
+        })
+        
+        $contentArea.Controls.Add($installBtn)
     }
 }
 
 # =========================
-# SHOW INSTALL PAGE
+# CREATE SIDEBAR BUTTONS
 # =========================
-function Show-InstallPage {
-    $content.Controls.Clear()
+$sidebar.Controls.Add((Make-SidebarBtn "Red Alert" 15 { Show-GamePage "Red Alert" "RedAlert.exe" "RA" }))
+$sidebar.Controls.Add((Make-SidebarBtn "Tiberian Dawn" 70 { Show-GamePage "Tiberian Dawn" "TiberianDawn.exe" "TD" }))
+$sidebar.Controls.Add((Make-SidebarBtn "Dune 2000" 125 { Show-GamePage "Dune 2000" "Dune2000.exe" "D2K" }))
 
-    $title = New-Object Windows.Forms.Label
-    $title.Text = "Install / Update"
-    $title.Size = New-Object Drawing.Size(800, 70)
-    $title.Location = New-Object Drawing.Point(40, 30)
-    $title.ForeColor = [Drawing.Color]::FromArgb(153, 204, 0)
-    $title.Font = New-Object Drawing.Font("Segoe UI", 32, "Bold")
-    $content.Controls.Add($title)
+$sidebar.Controls.Add((Make-SidebarBtn "Download/Update" 200 {
+    Update-ProgressBar 0 "Preparing download..."
+    Start-Sleep -Milliseconds 500
+    Download-OpenRA
+}))
 
-    $msg = New-Object Windows.Forms.Label
-    $msg.Text = "Download the latest release from GitHub"
-    $msg.Size = New-Object Drawing.Size(600, 40)
-    $msg.Location = New-Object Drawing.Point(40, 110)
-    $msg.ForeColor = "White"
-    $msg.Font = New-Object Drawing.Font("Segoe UI", 12)
-    $content.Controls.Add($msg)
-
-    $dlBtn = New-Object Windows.Forms.Button
-    $dlBtn.Text = "Download Latest"
-    $dlBtn.Size = New-Object Drawing.Size(280, 70)
-    $dlBtn.Location = New-Object Drawing.Point(40, 200)
-    $dlBtn.BackColor = [Drawing.Color]::FromArgb(76, 110, 45)
-    $dlBtn.ForeColor = "White"
-    $dlBtn.FlatStyle = "Flat"
-    $dlBtn.FlatAppearance.BorderSize = 0
-    $dlBtn.Font = New-Object Drawing.Font("Segoe UI", 13, "Bold")
-    $dlBtn.Cursor = "Hand"
-
-    $dlBtn.Add_MouseEnter({ $this.BackColor = [Drawing.Color]::FromArgb(100, 150, 60) })
-    $dlBtn.Add_MouseLeave({ $this.BackColor = [Drawing.Color]::FromArgb(76, 110, 45) })
-
-    $dlBtn.Add_Click({
-        $dlBtn.Enabled = $false
-        $script:ProgressLabel.Text = "Starting download..."
-        $script:ProgressValue = 0
-        $script:ProgressBar.Value = 0
-        $form.Refresh()
-        
-        Install-OpenRA
-        
-        $dlBtn.Enabled = $true
-    })
-
-    $content.Controls.Add($dlBtn)
-}
-
-# =========================
-# SIDEBAR BUTTONS
-# =========================
-Btn "Red Alert" 15 { Show-GamePage "Red Alert" "RedAlert.exe" "RA" }
-Btn "Tiberian Dawn" 70 { Show-GamePage "Tiberian Dawn" "TiberianDawn.exe" "TD" }
-Btn "Dune 2000" 125 { Show-GamePage "Dune 2000" "Dune2000.exe" "D2K" }
-
-Btn "Install/Update" 200 { Show-InstallPage }
-
-Btn "Smart Repair" 255 {
-    $script:ProgressLabel.Text = "Starting repair..."
-    $script:ProgressValue = 0
-    $script:ProgressBar.Value = 0
-    $form.Refresh()
+$sidebar.Controls.Add((Make-SidebarBtn "Smart Repair" 255 {
+    Update-ProgressBar 0 "Starting repair..."
+    Start-Sleep -Milliseconds 500
     Smart-Repair
-}
+}))
 
-Btn "Check Content" 310 {
+$sidebar.Controls.Add((Make-SidebarBtn "Check Status" 310 {
     $state = Get-ContentState
-    $msg = "Red Alert: $(if ($state.RA) { 'YES' } else { 'NO' })`nTiberian Dawn: $(if ($state.TD) { 'YES' } else { 'NO' })`nDune 2000: $(if ($state.D2K) { 'YES' } else { 'NO' })"
-    [System.Windows.Forms.MessageBox]::Show($msg, "Installation Status")
-}
+    $msg = "RED ALERT: $(if ($state.RA) { 'YES' } else { 'NO' })`nTIBERIAN DAWN: $(if ($state.TD) { 'YES' } else { 'NO' })`nDUNE 2000: $(if ($state.D2K) { 'YES' } else { 'NO' })"
+    [System.Windows.Forms.MessageBox]::Show($msg, "Installation Status", 0, 64) | Out-Null
+}))
 
-QuitBtn "Quit" 495
+$sidebar.Controls.Add((Make-QuitBtn 495))
 
 # =========================
 # STARTUP
 # =========================
-$form.Add_Load({ Show-GamePage "Red Alert" "RedAlert.exe" "RA" })
+$form.Add_Load({
+    Show-GamePage "Red Alert" "RedAlert.exe" "RA"
+})
 
 $form.ShowDialog()
