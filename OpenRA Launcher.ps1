@@ -109,11 +109,12 @@ function Launch($exe, $mode) {
 # PROGRESS BAR STATE
 # =========================
 $script:ProgressValue = 0
+$script:IsDownloading = $false
 
 function Set-ProgressBar {
     param([int]$Percent)
     
-    $script:ProgressValue = [Math]::Min($Percent, 100)
+    $script:ProgressValue = [Math]::Min([int]$Percent, 100)
     
     if ($script:ProgressLabel) {
         $script:ProgressLabel.Text = "Downloading... $($script:ProgressValue)%"
@@ -145,24 +146,24 @@ function Download-File {
         }
         
         $wc.DownloadProgressChanged += $progressAction
+        $wc.DownloadFileCompleted += {
+            $script:IsDownloading = $false
+        }
         
+        $script:IsDownloading = $true
         $wc.DownloadFileAsync((New-Object Uri $url), $out)
         
         $timeout = 0
-        while ($wc.IsBusy -and $timeout -lt 10800) {
+        while ($script:IsDownloading -and $timeout -lt 10800) {
             Start-Sleep -Milliseconds 100
             $timeout += 1
             [System.Windows.Forms.Application]::DoEvents()
         }
         
-        if ($wc.IsBusy) {
-            $wc.CancelAsync()
-            return $false
-        }
-        
         return (Test-Path $out)
     }
     catch {
+        $script:IsDownloading = $false
         return $false
     }
 }
@@ -186,9 +187,13 @@ function Install-OpenRA {
             return $false
         }
         
-        $asset = $rel.assets | Where-Object { 
-            ($_.name -match "win") -and ($_.name -match "portable")
-        } | Select-Object -First 1
+        $asset = $null
+        foreach ($a in $rel.assets) {
+            if ($a.name -like "*win*portable*") {
+                $asset = $a
+                break
+            }
+        }
         
         if (-not $asset) { 
             $script:ProgressLabel.Text = "Error: No portable release found"
@@ -200,12 +205,8 @@ function Install-OpenRA {
         $tmp = Join-Path $env:TEMP "openra_extract"
         
         # Remove old files
-        if (Test-Path $zip) {
-            Remove-Item $zip -Force -ErrorAction SilentlyContinue
-        }
-        if (Test-Path $tmp) {
-            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
-        }
+        if (Test-Path $zip) { Remove-Item $zip -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
         
         # Download
         $script:ProgressLabel.Text = "Downloading OpenRA..."
@@ -228,9 +229,7 @@ function Install-OpenRA {
         Expand-Archive -Path $zip -DestinationPath $tmp -Force -ErrorAction Stop
         
         # Copy to app
-        if (!(Test-Path $app)) {
-            New-Item -ItemType Directory -Path $app -Force | Out-Null
-        }
+        if (!(Test-Path $app)) { New-Item -ItemType Directory -Path $app -Force | Out-Null }
         
         # Remove old app contents
         Get-ChildItem -Path $app -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
@@ -305,6 +304,7 @@ $content = New-Object Windows.Forms.Panel
 $content.Size = New-Object Drawing.Size(900, 570)
 $content.Location = New-Object Drawing.Point(200, 0)
 $content.BackColor = [Drawing.Color]::FromArgb(20,20,20)
+$content.AutoScroll = $true
 $topPanel.Controls.Add($content)
 
 $progressPanel = New-Object Windows.Forms.Panel
@@ -314,7 +314,7 @@ $progressPanel.BackColor = [Drawing.Color]::FromArgb(25,25,25)
 $progressPanel.BorderStyle = "FixedSingle"
 $form.Controls.Add($progressPanel)
 
-# Standard progress bar (Steam-style yellow)
+# Standard progress bar
 $script:ProgressBar = New-Object Windows.Forms.ProgressBar
 $script:ProgressBar.Size = New-Object Drawing.Size(850, 20)
 $script:ProgressBar.Location = New-Object Drawing.Point(220, 15)
@@ -355,13 +355,15 @@ function Btn($text,$y,$action) {
     $b.Add_MouseLeave({ $this.BackColor = $normalColor })
     $b.Add_MouseDown({
         $this.BackColor = $activeColor
-        $this.Size = New-Object Drawing.Size(190, 50)
-        $this.Location = New-Object Drawing.Point(5, $y - 2)
+        $this.Size = New-Object Drawing.Size(260, 80)
+        $this.Location = New-Object Drawing.Point(-30, $y - 17)
+        $this.Font = New-Object Drawing.Font("Segoe UI", 12, "Bold")
     })
     $b.Add_MouseUp({
         $this.BackColor = $hoverColor
         $this.Size = New-Object Drawing.Size(180, 45)
         $this.Location = New-Object Drawing.Point(10, $y)
+        $this.Font = New-Object Drawing.Font("Segoe UI", 9)
     })
 
     $b.Add_Click($action)
@@ -384,13 +386,15 @@ function QuitBtn($text,$y) {
     $b.Add_MouseLeave({ $this.BackColor = $quitColor })
     $b.Add_MouseDown({
         $this.BackColor = $activeColor
-        $this.Size = New-Object Drawing.Size(190, 50)
-        $this.Location = New-Object Drawing.Point(5, $y - 2)
+        $this.Size = New-Object Drawing.Size(260, 80)
+        $this.Location = New-Object Drawing.Point(-30, $y - 17)
+        $this.Font = New-Object Drawing.Font("Segoe UI", 12, "Bold")
     })
     $b.Add_MouseUp({
         $this.BackColor = [Drawing.Color]::FromArgb(170,0,0)
         $this.Size = New-Object Drawing.Size(180, 45)
         $this.Location = New-Object Drawing.Point(10, $y)
+        $this.Font = New-Object Drawing.Font("Segoe UI", 9)
     })
 
     $b.Add_Click({ $form.Close() })
@@ -448,13 +452,15 @@ function Show-GamePage($gameName, $gameExe, $gameCode) {
         $playBtn.Add_MouseLeave({ $this.BackColor = $normalColor })
         $playBtn.Add_MouseDown({
             $this.BackColor = $activeColor
-            $this.Size = New-Object Drawing.Size(290, 65)
-            $this.Location = New-Object Drawing.Point(35, 177)
+            $this.Size = New-Object Drawing.Size(380, 90)
+            $this.Location = New-Object Drawing.Point(-10, 150)
+            $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
         })
         $playBtn.Add_MouseUp({
             $this.BackColor = $hoverColor
             $this.Size = New-Object Drawing.Size(280, 60)
             $this.Location = New-Object Drawing.Point(40, 180)
+            $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
         })
         $playBtn.Add_Click({ Launch $gameExe "UserData" })
         $content.Controls.Add($playBtn)
@@ -474,13 +480,15 @@ function Show-GamePage($gameName, $gameExe, $gameCode) {
         $portableBtn.Add_MouseLeave({ $this.BackColor = $normalColor })
         $portableBtn.Add_MouseDown({
             $this.BackColor = $activeColor
-            $this.Size = New-Object Drawing.Size(290, 65)
-            $this.Location = New-Object Drawing.Point(35, 267)
+            $this.Size = New-Object Drawing.Size(380, 90)
+            $this.Location = New-Object Drawing.Point(-10, 240)
+            $this.Font = New-Object Drawing.Font("Segoe UI", 18, "Bold")
         })
         $portableBtn.Add_MouseUp({
             $this.BackColor = $hoverColor
             $this.Size = New-Object Drawing.Size(280, 60)
             $this.Location = New-Object Drawing.Point(40, 270)
+            $this.Font = New-Object Drawing.Font("Segoe UI", 14, "Bold")
         })
         $portableBtn.Add_Click({ Launch $gameExe "Portable" })
         $content.Controls.Add($portableBtn)
@@ -583,7 +591,7 @@ Btn "Smart Repair" 255 {
 
 Btn "Check Content" 310 {
     $state = Get-ContentState
-    $msg = "Red Alert: $(if ($state.RA) { '✓' } else { '✗' })`nTiberian Dawn: $(if ($state.TD) { '✓' } else { '✗' })`nDune 2000: $(if ($state.D2K) { '✓' } else { '✗' })"
+    $msg = "Red Alert: $(if ($state.RA) { 'YES' } else { 'NO' })`nTiberian Dawn: $(if ($state.TD) { 'YES' } else { 'NO' })`nDune 2000: $(if ($state.D2K) { 'YES' } else { 'NO' })"
     [System.Windows.Forms.MessageBox]::Show($msg, "Installation Status")
 }
 
