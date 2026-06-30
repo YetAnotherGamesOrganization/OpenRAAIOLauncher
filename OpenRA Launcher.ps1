@@ -82,10 +82,15 @@ function Enable-PortableMode {
     $targetDir = if ($TargetMode -eq "Portable") { $data } else { $userData }
     
     try {
+        if (!(Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
+        }
+        
         if (Test-Path $supportDir) {
             cmd /c rmdir "$supportDir" 2>$null
         }
-        cmd /c mklink /J "$supportDir" "$targetDir" | Out-Null
+        
+        cmd /c mklink /J "$supportDir" "$targetDir" 2>$null
     } catch {}
 }
 
@@ -101,87 +106,162 @@ function Launch($exe, $mode) {
 }
 
 # =========================
+# CLASSIC STEAM PROGRESS BAR (CUSTOM PAINTED)
+# =========================
+$script:ProgressValue = 0
+
+function Draw-SteamProgressBar {
+    param([int]$Percent)
+    
+    $script:ProgressValue = $Percent
+    
+    if ($script:ProgressLabel) {
+        $script:ProgressLabel.Text = "Downloading... $Percent%"
+        $form.Refresh()
+    }
+    
+    if ($script:ProgressCanvas) {
+        $script:ProgressCanvas.Invalidate()
+    }
+}
+
+# =========================
 # DOWNLOAD ENGINE (SAFE + PROGRESS)
 # =========================
-function Download-File($url,$out,$bar,$label) {
-    $wc = New-Object System.Net.WebClient
-
-    $wc.DownloadProgressChanged += {
-        param($s,$e)
-        try {
-            $bar.Value = $e.ProgressPercentage
-            $label.Text = "Downloading... $($e.ProgressPercentage)%"
-            $form.Refresh()
-        } catch {}
-    }
-
-    $wc.DownloadFileAsync((New-Object Uri $url),$out)
-
-    while ($wc.IsBusy) { Start-Sleep -Milliseconds 100 }
-}
-
-# =========================
-# INSTALL OPENRA (SIMPLIFIED SAFE)
-# =========================
-function Install-OpenRA($bar,$label) {
+function Download-File {
+    param(
+        [string]$url,
+        [string]$out
+    )
+    
     try {
-        $repo = "OpenRA/OpenRA"
-        $rel = Invoke-RestMethod "https://api.github.com/repos/$repo/releases/latest"
-
-        $asset = $rel.assets |
-            Where-Object { $_.name -match "win" -and $_.name -match "portable" } |
-            Select-Object -First 1
-
-        if (-not $asset) { 
-            $label.Text = "Error: No portable release found"
-            return
+        $wc = New-Object System.Net.WebClient
+        
+        $wc.DownloadProgressChanged += {
+            param($s,$e)
+            try {
+                Draw-SteamProgressBar $e.ProgressPercentage
+            } catch {}
         }
-
-        $zip = "$env:TEMP\openra.zip"
-        $tmp = "$env:TEMP\openra_tmp"
-
-        Download-File $asset.browser_download_url $zip $bar $label
-
-        if (Test-Path $tmp) {
-            Remove-Item $tmp -Recurse -Force
+        
+        $wc.DownloadFileAsync((New-Object Uri $url), $out)
+        
+        while ($wc.IsBusy) { 
+            Start-Sleep -Milliseconds 100 
+            [System.Windows.Forms.Application]::DoEvents()
         }
-
-        $label.Text = "Extracting files..."
-        $form.Refresh()
-
-        Expand-Archive $zip $tmp -Force
-
-        if (!(Test-Path $app)) {
-            New-Item -ItemType Directory -Path $app | Out-Null
-        }
-
-        Copy-Item "$tmp\*" $app -Recurse -Force
-
-        Remove-Item $zip -Force
-        Remove-Item $tmp -Recurse -Force
-
-        $label.Text = "Installation complete!"
-        $bar.Value = 100
-
-    } catch {
-        $label.Text = "Installation failed"
+        
+        return $true
+    }
+    catch {
+        return $false
     }
 }
 
 # =========================
-# SMART REPAIR
+# INSTALL OPENRA (FIXED)
 # =========================
-function Smart-Repair($bar,$label) {
-    $state = Get-ContentState
-
-    if ($state.RA -and $state.TD -and $state.D2K) {
-        $label.Text = "All games present - no repair needed"
-        $bar.Value = 100
-        return
+function Install-OpenRA {
+    try {
+        $script:ProgressLabel.Text = "Fetching latest release..."
+        $form.Refresh()
+        
+        $repo = "OpenRA/OpenRA"
+        $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/$repo/releases/latest" -TimeoutSec 10
+        
+        if (-not $rel) {
+            $script:ProgressLabel.Text = "Error: Could not reach GitHub"
+            Draw-SteamProgressBar 0
+            return $false
+        }
+        
+        $asset = $rel.assets | Where-Object { 
+            $_.name -match "win" -and $_.name -match "portable" 
+        } | Select-Object -First 1
+        
+        if (-not $asset) { 
+            $script:ProgressLabel.Text = "Error: No portable release found"
+            Draw-SteamProgressBar 0
+            return $false
+        }
+        
+        $zip = Join-Path $env:TEMP "openra.zip"
+        $tmp = Join-Path $env:TEMP "openra_tmp_$([guid]::NewGuid().ToString().Substring(0,8))"
+        
+        # Download
+        $script:ProgressLabel.Text = "Downloading..."
+        $downloadSuccess = Download-File -url $asset.browser_download_url -out $zip
+        
+        if (-not $downloadSuccess -or -not (Test-Path $zip)) {
+            $script:ProgressLabel.Text = "Error: Download failed"
+            Draw-SteamProgressBar 0
+            return $false
+        }
+        
+        # Extract
+        $script:ProgressLabel.Text = "Extracting files..."
+        Draw-SteamProgressBar 85
+        $form.Refresh()
+        
+        if (Test-Path $tmp) {
+            Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        
+        Expand-Archive -Path $zip -DestinationPath $tmp -Force -ErrorAction Stop
+        
+        # Copy to app
+        if (!(Test-Path $app)) {
+            New-Item -ItemType Directory -Path $app -Force | Out-Null
+        }
+        
+        # Clear old app directory
+        if (Test-Path $app) {
+            Get-ChildItem $app -Recurse -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        
+        Copy-Item "$tmp\*" $app -Recurse -Force -ErrorAction Stop
+        
+        # Cleanup
+        Remove-Item $zip -Force -ErrorAction SilentlyContinue
+        Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
+        
+        $script:ProgressLabel.Text = "Installation complete!"
+        Draw-SteamProgressBar 100
+        
+        return $true
     }
+    catch {
+        $script:ProgressLabel.Text = "Error: Installation failed"
+        Draw-SteamProgressBar 0
+        return $false
+    }
+}
 
-    $label.Text = "Missing games detected - installing..."
-    Install-OpenRA $bar $label
+# =========================
+# SMART REPAIR (FIXED)
+# =========================
+function Smart-Repair {
+    try {
+        $script:ProgressLabel.Text = "Checking games..."
+        Draw-SteamProgressBar 20
+        $form.Refresh()
+        
+        $state = Get-ContentState
+        
+        if ($state.RA -and $state.TD -and $state.D2K) {
+            $script:ProgressLabel.Text = "All games present - no repair needed"
+            Draw-SteamProgressBar 100
+            return $true
+        }
+        
+        $script:ProgressLabel.Text = "Missing games detected - installing..."
+        Install-OpenRA
+        
+    }
+    catch {
+        $script:ProgressLabel.Text = "Error: Repair failed"
+        Draw-SteamProgressBar 0
+    }
 }
 
 # =========================
@@ -216,25 +296,46 @@ $progressPanel.BackColor = [Drawing.Color]::FromArgb(25,25,25)
 $progressPanel.BorderStyle = "FixedSingle"
 $form.Controls.Add($progressPanel)
 
-# Progress bar (Steam-style thin)
-$bar = New-Object Windows.Forms.ProgressBar
-$bar.Size = New-Object Drawing.Size(850, 10)
-$bar.Location = New-Object Drawing.Point(220, 20)
-$bar.Style = "Continuous"
-$bar.BackColor = [Drawing.Color]::FromArgb(40,40,40)
-$bar.ForeColor = [Drawing.Color]::FromArgb(153, 204, 0)
-$progressPanel.Controls.Add($bar)
-$script:GlobalBar = $bar
+# Classic Steam progress bar (canvas for custom painting)
+$script:ProgressCanvas = New-Object Windows.Forms.PictureBox
+$script:ProgressCanvas.Size = New-Object Drawing.Size(850, 30)
+$script:ProgressCanvas.Location = New-Object Drawing.Point(220, 15)
+$script:ProgressCanvas.BackColor = [Drawing.Color]::FromArgb(40, 40, 40)
+$script:ProgressCanvas.BorderStyle = "FixedSingle"
+$progressPanel.Controls.Add($script:ProgressCanvas)
+
+# Paint event for classic Steam style
+$script:ProgressCanvas.Add_Paint({
+    param($sender, $e)
+    
+    if ($script:ProgressValue -eq 0) {
+        return
+    }
+    
+    $barWidth = $sender.Width - 4
+    $barHeight = $sender.Height - 4
+    $filledWidth = [int]([double]$script:ProgressValue / 100.0 * $barWidth)
+    
+    # Draw animated segments (classic Steam mod download style)
+    $segmentSize = 8
+    $segmentGap = 2
+    $x = 2
+    
+    while ($x < $filledWidth) {
+        $rect = New-Object System.Drawing.Rectangle($x, 2, $segmentSize, $barHeight)
+        $e.Graphics.FillRectangle([System.Drawing.Brushes]::FromArgb(153, 204, 0), $rect)
+        $x += $segmentSize + $segmentGap
+    }
+})
 
 # Progress label
-$label = New-Object Windows.Forms.Label
-$label.Text = "Ready"
-$label.Size = New-Object Drawing.Size(850, 30)
-$label.Location = New-Object Drawing.Point(220, 35)
-$label.ForeColor = [Drawing.Color]::Gray
-$label.Font = New-Object Drawing.Font("Segoe UI", 10)
-$progressPanel.Controls.Add($label)
-$script:GlobalLabel = $label
+$script:ProgressLabel = New-Object Windows.Forms.Label
+$script:ProgressLabel.Text = "Ready"
+$script:ProgressLabel.Size = New-Object Drawing.Size(850, 25)
+$script:ProgressLabel.Location = New-Object Drawing.Point(220, 50)
+$script:ProgressLabel.ForeColor = [Drawing.Color]::Gray
+$script:ProgressLabel.Font = New-Object Drawing.Font("Segoe UI", 10)
+$progressPanel.Controls.Add($script:ProgressLabel)
 
 # =========================
 # BUTTON STYLES
@@ -508,9 +609,13 @@ function Show-InstallPage {
 
     $dlBtn.Add_Click({
         $dlBtn.Enabled = $false
-        $script:GlobalLabel.Text = "Starting download..."
-        $script:GlobalBar.Value = 0
-        Install-OpenRA $script:GlobalBar $script:GlobalLabel
+        $script:ProgressLabel.Text = "Starting download..."
+        $script:ProgressValue = 0
+        $script:ProgressCanvas.Invalidate()
+        $form.Refresh()
+        
+        Install-OpenRA
+        
         $dlBtn.Enabled = $true
     })
 
@@ -537,16 +642,12 @@ Btn "Install/Update" 200 {
 }
 
 Btn "Smart Repair" 255 {
-    $content.Controls.Clear()
-    $msg = New-Object Windows.Forms.Label
-    $msg.Text = "Running repair..."
-    $msg.Size = New-Object Drawing.Size(600, 40)
-    $msg.Location = New-Object Drawing.Point(40, 30)
-    $msg.ForeColor = "White"
-    $msg.Font = New-Object Drawing.Font("Segoe UI", 14)
-    $content.Controls.Add($msg)
+    $script:ProgressLabel.Text = "Starting repair..."
+    $script:ProgressValue = 0
+    $script:ProgressCanvas.Invalidate()
+    $form.Refresh()
     
-    Smart-Repair $script:GlobalBar $script:GlobalLabel
+    Smart-Repair
 }
 
 Btn "Check Content" 310 {
